@@ -1,0 +1,62 @@
+name: Build ReShade Metal Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish this build as a GitHub Release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build app
+        run: |
+          xcodebuild \
+            -project ReShadeMetalInstaller.xcodeproj \
+            -scheme ReShadeMetalInstaller \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package app and checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/DerivedData/Build/Products/Release/ReShadeMetalInstaller.app"
+          test -d "$app"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist/ReShade-Metal-Installer-macos.zip
+          shasum -a 256 dist/ReShade-Metal-Installer-macos.zip > dist/ReShade-Metal-Installer-macos.zip.sha256
+          release_date="$(date -u +'%Y.%m.%d')"
+          tag="v${release_date}.${GITHUB_RUN_NUMBER}"
+          title="ReShade Metal Installer ${release_date} (Build ${GITHUB_RUN_NUMBER})"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReShade-Metal-Installer-macos
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.package.outputs.title }}
+        run: gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TITLE" --generate-notes
