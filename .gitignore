@@ -1,0 +1,15 @@
+# Xcode and Swift build products
+.build/
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Local runtime artifacts and scratch data
+.DS_Store
+dxgi.dll
+dxgi.original.dll
+*.dSYM/
+*.app/
+work/
+before-test/
