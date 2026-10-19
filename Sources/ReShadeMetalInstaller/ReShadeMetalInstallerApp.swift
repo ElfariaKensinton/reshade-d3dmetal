@@ -491,7 +491,7 @@ private struct ContentView: View {
         .onChange(of: model.page) { _, newPage in
             if newPage == .shaders { model.refreshGames() }
         }
-        .alert("ReShade Metal Installer", isPresented: $model.showAlert) {
+        .alert("Reshade macOS", isPresented: $model.showAlert) {
             Button("OK", role: .cancel) { }
         } message: {
             Text(model.alertMessage)
