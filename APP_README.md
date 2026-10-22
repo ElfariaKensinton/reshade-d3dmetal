@@ -22,12 +22,12 @@ Requirements: macOS 26 or later and Xcode with the macOS 26 SDK.
 
 1. Install and launch the Windows game once from its Wine-based wrapper, then close it.
 2. In ReShade Metal Installer, choose the game's actual 64-bit `.exe` in the bottle/prefix.
-3. Choose whether to download the official ReShade shader collection.
+3. Choose whether to add the official ReShade shader collection. The installer adds only files that are missing and never overwrites existing shader, texture, include, or custom files.
 4. Choose a ReShade version in **Choose the ReShade version**. The selector lists only builds with verified setup/runtime hashes and a matching D3DMetal patch profile. The currently verified x64 versions are **4.1.1, 4.2.1, 4.3.0, 4.4.2, 4.5.4, 4.6.1, 4.7.0, 4.8.2, 4.9.1, 5.0.0, 5.0.2, 5.1.0, 5.2.2, 5.3.0, 5.4.2, 5.5.2, 5.6.0, 5.7.0, 5.8.0, 5.9.2, 6.7.2, and 6.8.0**. Select **Install ReShade** to download the selected build, verify its hashes, apply the matching local patch, and install the patched `dxgi.dll` and configuration files beside the executable.
 5. If a game already has a `dxgi.dll`, the installer retains it as `dxgi.original.dll` and configures ReShade to proxy it. It refuses a pre-existing `dxgi.original.dll` in that case to avoid overwriting an existing proxy chain.
 6. In the wrapper's Wine settings, enable a **native** `dxgi` override (use Builtin as fallback if the wrapper offers that choice) and keep D3DMetal enabled. Launch the game and press **Home** to open ReShade's overlay.
 
-The installer creates a hidden `.ReShadeMetalBackup-*` folder and a `.reshade-metal-install.json` manifest beside the game executable. Select that same game again and choose **Restore backup** to remove the installed files and restore backed-up files. Keep the backup folder until the game has launched successfully.
+The installer creates a hidden `.ReShadeMetalBackup-*` folder and a `.reshade-metal-install.json` manifest beside the game executable. Select that same game again and choose **Restore backup** to restore the original runtime and configuration. It removes only unchanged shader files it added; custom files, added shaders, and edits are preserved. Keep the backup folder until the game has launched successfully.
 
 ## Configure shaders per game
 
@@ -58,7 +58,7 @@ Open **Shaders** and use **Add game** to register each game's 64-bit `.exe`. The
 
 ## ReShade HUD text on D3DMetal
 
-The 6.7.2 and 6.8.0 profiles force ReShade’s internal Device1 queries to use legacy blend-state creation, addressing garbled overlay text caused by D3DMetal’s `CreateBlendState1` path losing alpha blending. Each profile uses its version-specific signature and offset. The 6.7.2 patched hash is reproducible, but its in-game font fix still needs runtime confirmation.
+The HUD text workaround redirects ReShade’s internal `ID3D11Device1` query to the legacy Device fallback, avoiding D3DMetal’s `CreateBlendState1` path that can lose alpha blending and garble overlay text. The installer locates the IID through executable references: a nearby `QueryInterface` call in newer builds, or a full-width SIMD load from the static GUID table in older builds. It therefore avoids a ReShade-version-specific IID offset and does not alter unrelated copies of the GUID. The main compatibility hook still requires a supported, hash-verified ReShade build profile. The 6.8.0 overlay was verified in-game; the 6.7.2 font result still needs runtime confirmation.
 
 ## Subnautica 6.8.0 compatibility
 

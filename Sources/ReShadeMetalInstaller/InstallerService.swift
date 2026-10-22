@@ -255,6 +255,17 @@ enum InstallerService {
         data(hex: "443b81200100007539443b8924010000753085d274083b91480100007524448b5424284585d27409443b91300100007511448b542430443b9160010000750331c0c34889e044894018e9000000009090")
     }
 
+    private struct PESection {
+        let name: String
+        let virtualSize: Int
+        let virtualAddress: Int
+        let rawSize: Int
+        let rawPointer: Int
+        let characteristics: UInt32
+
+        var isExecutable: Bool { characteristics & 0x20000000 != 0 }
+    }
+
     private struct InstallManifest: Codable {
         var formatVersion: Int
         var reshadeVersion: String
@@ -262,6 +273,46 @@ enum InstallerService {
         var backupFolderName: String
         var installedNames: [String]
         var originalNames: [String]
+        var installedShaderFiles: [String: String]
+
+        private enum CodingKeys: String, CodingKey {
+            case formatVersion
+            case reshadeVersion
+            case installedAt
+            case backupFolderName
+            case installedNames
+            case originalNames
+            case installedShaderFiles
+        }
+
+        init(
+            formatVersion: Int,
+            reshadeVersion: String,
+            installedAt: Date,
+            backupFolderName: String,
+            installedNames: [String],
+            originalNames: [String],
+            installedShaderFiles: [String: String] = [:]
+        ) {
+            self.formatVersion = formatVersion
+            self.reshadeVersion = reshadeVersion
+            self.installedAt = installedAt
+            self.backupFolderName = backupFolderName
+            self.installedNames = installedNames
+            self.originalNames = originalNames
+            self.installedShaderFiles = installedShaderFiles
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            formatVersion = try container.decode(Int.self, forKey: .formatVersion)
+            reshadeVersion = try container.decode(String.self, forKey: .reshadeVersion)
+            installedAt = try container.decode(Date.self, forKey: .installedAt)
+            backupFolderName = try container.decode(String.self, forKey: .backupFolderName)
+            installedNames = try container.decode([String].self, forKey: .installedNames)
+            originalNames = try container.decode([String].self, forKey: .originalNames)
+            installedShaderFiles = try container.decodeIfPresent([String: String].self, forKey: .installedShaderFiles) ?? [:]
+        }
     }
 
     static func validateGameExecutable(_ url: URL) throws {
@@ -714,12 +765,10 @@ enum InstallerService {
             throw InstallerError.invalidExecutable("This game already has both dxgi.dll and dxgi.original.dll. That usually indicates an existing proxy chain; remove or document that setup before installing ReShade Metal so the chain is not overwritten.")
         }
         var originalNames = ["dxgi.dll", "ReShade.ini", "ReShadePreset.ini"]
-        if installShaders { originalNames.append("reshade-shaders") }
         if requiresProxy { originalNames.append("dxgi.original.dll") }
         originalNames = originalNames.filter { fileManager.fileExists(atPath: gameDirectory.appendingPathComponent($0).path) }
 
         var installedNames = ["dxgi.dll", "ReShade.ini", "ReShadePreset.ini"]
-        if installShaders { installedNames.append("reshade-shaders") }
         if requiresProxy { installedNames.append("dxgi.original.dll") }
 
         let backupFolderName = ".ReShadeMetalBackup-\(timestamp())-\(UUID().uuidString.prefix(6))"
@@ -728,6 +777,7 @@ enum InstallerService {
         try fileManager.createDirectory(at: originalsDirectory, withIntermediateDirectories: true)
         var movedNames: [String] = []
         var installedOrCopiedNames: [String] = []
+        var installedShaderFiles: [String: String] = [:]
 
         do {
             for name in originalNames {
@@ -753,15 +803,27 @@ enum InstallerService {
             try Data(preset.utf8).write(to: gameDirectory.appendingPathComponent("ReShadePreset.ini"), options: .atomic)
             installedOrCopiedNames.append("ReShadePreset.ini")
             if let stagedShaders {
-                try fileManager.copyItem(at: stagedShaders, to: gameDirectory.appendingPathComponent("reshade-shaders", isDirectory: true))
-                installedOrCopiedNames.append("reshade-shaders")
+                try mergeMissingShaderFiles(
+                    from: stagedShaders,
+                    into: gameDirectory.appendingPathComponent("reshade-shaders", isDirectory: true),
+                    recordedHashes: &installedShaderFiles
+                )
             }
 
-            let manifest = InstallManifest(formatVersion: 1, reshadeVersion: build.version, installedAt: Date(), backupFolderName: backupFolderName, installedNames: installedNames, originalNames: originalNames)
+            let manifest = InstallManifest(
+                formatVersion: 2,
+                reshadeVersion: build.version,
+                installedAt: Date(),
+                backupFolderName: backupFolderName,
+                installedNames: installedNames,
+                originalNames: originalNames,
+                installedShaderFiles: installedShaderFiles
+            )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
         } catch {
+            removeUnmodifiedShaderFiles(installedShaderFiles, gameDirectory: gameDirectory)
             for name in installedOrCopiedNames.reversed() {
                 let item = gameDirectory.appendingPathComponent(name)
                 if fileManager.fileExists(atPath: item.path) { try? fileManager.removeItem(at: item) }
@@ -795,12 +857,15 @@ enum InstallerService {
         let manifest: InstallManifest
         do { manifest = try JSONDecoder().decode(InstallManifest.self, from: manifestData) }
         catch { throw InstallerError.unsafeManifest }
-        guard manifest.formatVersion == 1,
+        guard [1, 2].contains(manifest.formatVersion),
               manifest.backupFolderName.hasPrefix(".ReShadeMetalBackup-"),
               !manifest.backupFolderName.contains("/"),
               !manifest.backupFolderName.contains("\\"),
               manifest.installedNames.allSatisfy(allowedManagedName),
-              manifest.originalNames.allSatisfy(allowedManagedName) else {
+              manifest.originalNames.allSatisfy(allowedManagedName),
+              manifest.installedShaderFiles.allSatisfy({
+                  isSafeShaderRelativePath($0.key) && $0.value.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil
+              }) else {
             throw InstallerError.unsafeManifest
         }
 
@@ -816,7 +881,14 @@ enum InstallerService {
         progress("Removing installed ReShade files and preserving current copies…")
         let currentInstallDirectory = backupRoot.appendingPathComponent("installed-before-restore", isDirectory: true)
         try fileManager.createDirectory(at: currentInstallDirectory, withIntermediateDirectories: true)
+        // Older manifests treated the whole shader tree as installer-owned. If no
+        // shader tree existed before that install, keep the live tree rather than
+        // deleting user additions that cannot be distinguished from shipped files.
+        let keepLegacyShaderTree = manifest.formatVersion == 1 &&
+            manifest.installedNames.contains("reshade-shaders") &&
+            !manifest.originalNames.contains("reshade-shaders")
         for name in manifest.installedNames {
+            if name == "reshade-shaders", keepLegacyShaderTree { continue }
             let live = gameDirectory.appendingPathComponent(name)
             guard fileManager.fileExists(atPath: live.path) else { continue }
             let saved = currentInstallDirectory.appendingPathComponent(name)
@@ -830,6 +902,26 @@ enum InstallerService {
                 let live = gameDirectory.appendingPathComponent(name)
                 if fileManager.fileExists(atPath: live.path) { try fileManager.removeItem(at: live) }
                 try fileManager.copyItem(at: backup, to: live)
+            }
+
+            // For legacy installs that replaced an existing shader tree, restore
+            // the original files first, then merge in newly added files from the
+            // retained live-tree snapshot without overwriting restored content.
+            if manifest.formatVersion == 1,
+               manifest.installedNames.contains("reshade-shaders"),
+               manifest.originalNames.contains("reshade-shaders") {
+                let savedShaders = currentInstallDirectory.appendingPathComponent("reshade-shaders", isDirectory: true)
+                let restoredShaders = gameDirectory.appendingPathComponent("reshade-shaders", isDirectory: true)
+                if fileManager.fileExists(atPath: savedShaders.path), fileManager.fileExists(atPath: restoredShaders.path) {
+                    var ignoredHashes: [String: String] = [:]
+                    // The complete snapshot remains in the backup even if any file
+                    // cannot be merged, so restoring the original install can finish.
+                    try? mergeMissingShaderFiles(from: savedShaders, into: restoredShaders, recordedHashes: &ignoredHashes)
+                }
+            }
+
+            if manifest.formatVersion == 2 {
+                removeUnmodifiedShaderFiles(manifest.installedShaderFiles, gameDirectory: gameDirectory)
             }
             try fileManager.removeItem(at: manifestURL)
         } catch {
@@ -856,7 +948,10 @@ enum InstallerService {
         let backupName = ".ReShadeMetalBackup-\(timestamp())-\(UUID().uuidString.prefix(6))"
         let backupRoot = gameDirectory.appendingPathComponent(backupName, isDirectory: true)
         let snapshotDirectory = backupRoot.appendingPathComponent("removed-installation", isDirectory: true)
-        var namesToSnapshot = ["dxgi.dll", "ReShade.ini", "ReShadePreset.ini", "reshade-shaders"]
+        // Without a manifest there is no reliable way to tell which shader files
+        // belong to ReShade and which were added or edited by the user. Preserve
+        // the complete shader tree rather than treating it as installer-owned.
+        var namesToSnapshot = ["dxgi.dll", "ReShade.ini", "ReShadePreset.ini"]
         if restoreOriginalDXGI { namesToSnapshot.append("dxgi.original.dll") }
         namesToSnapshot = namesToSnapshot.filter { fileManager.fileExists(atPath: gameDirectory.appendingPathComponent($0).path) }
 
@@ -867,7 +962,7 @@ enum InstallerService {
                 try fileManager.copyItem(at: gameDirectory.appendingPathComponent(name), to: snapshotDirectory.appendingPathComponent(name))
             }
 
-            for name in ["dxgi.dll", "ReShade.ini", "ReShadePreset.ini", "reshade-shaders"] {
+            for name in ["dxgi.dll", "ReShade.ini", "ReShadePreset.ini"] {
                 let liveURL = gameDirectory.appendingPathComponent(name)
                 if fileManager.fileExists(atPath: liveURL.path) { try fileManager.removeItem(at: liveURL) }
             }
@@ -880,11 +975,125 @@ enum InstallerService {
             throw InstallerError.filesystemFailure("Restore did not finish: \(error.localizedDescription). A recovery copy was saved at \(snapshotDirectory.path); inspect it before retrying.")
         }
 
-        progress("Detected ReShade files removed. A recovery copy has been retained.")
+        progress("Detected ReShade runtime and configuration removed. The shader tree was preserved.")
         if restoreOriginalDXGI {
-            return "Restored the saved dxgi.original.dll and removed detected ReShade files. Recovery copy: \(backupName)."
+            return "Restored the saved dxgi.original.dll and removed detected ReShade runtime/configuration files. Existing shaders and textures were preserved. Recovery copy: \(backupName)."
         }
-        return "Removed detected ReShade files. No dxgi.original.dll proxy was configured, so the wrapper's DXGI fallback will be used. Recovery copy: \(backupName)."
+        return "Removed detected ReShade runtime/configuration files. Existing shaders and textures were preserved. No dxgi.original.dll proxy was configured, so the wrapper's DXGI fallback will be used. Recovery copy: \(backupName)."
+    }
+
+    private static func mergeMissingShaderFiles(
+        from sourceRoot: URL,
+        into destinationRoot: URL,
+        recordedHashes: inout [String: String]
+    ) throws {
+        let fileManager = FileManager.default
+        var rootIsDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: destinationRoot.path, isDirectory: &rootIsDirectory) {
+            let values = try destinationRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard rootIsDirectory.boolValue, values.isDirectory == true, values.isSymbolicLink != true else {
+                throw InstallerError.filesystemFailure("The existing reshade-shaders path is not a safe directory. Existing files were left untouched.")
+            }
+        } else {
+            try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: false)
+        }
+
+        guard let enumerator = fileManager.enumerator(
+            at: sourceRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsPackageDescendants]
+        ) else {
+            throw InstallerError.filesystemFailure("Could not read the staged shader collection.")
+        }
+
+        let sourcePrefix = sourceRoot.standardizedFileURL.path + "/"
+        for case let sourceURL as URL in enumerator {
+            let sourceValues = try sourceURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard sourceValues.isRegularFile == true, sourceValues.isSymbolicLink != true else { continue }
+
+            let sourcePath = sourceURL.standardizedFileURL.path
+            guard sourcePath.hasPrefix(sourcePrefix) else { continue }
+            let relativePath = String(sourcePath.dropFirst(sourcePrefix.count))
+            guard isSafeShaderRelativePath(relativePath),
+                  let destinationURL = try shaderFileURL(relativePath: relativePath, under: destinationRoot, createParentDirectories: true) else {
+                continue
+            }
+            // Existing effects, textures, includes and custom files always win.
+            if itemExistsIncludingSymlink(at: destinationURL) { continue }
+
+            let sourceHash = try sha256(of: sourceURL)
+            do {
+                try fileManager.copyItem(at: sourceURL, to: destinationURL)
+                recordedHashes[relativePath] = sourceHash
+            } catch {
+                // A concurrently created destination is now user-owned; leave it alone.
+                if itemExistsIncludingSymlink(at: destinationURL) { continue }
+                throw error
+            }
+        }
+    }
+
+    private static func removeUnmodifiedShaderFiles(_ files: [String: String], gameDirectory: URL) {
+        let fileManager = FileManager.default
+        let shaderRoot = gameDirectory.appendingPathComponent("reshade-shaders", isDirectory: true)
+        for (relativePath, expectedHash) in files {
+            guard isSafeShaderRelativePath(relativePath),
+                  let url = try? shaderFileURL(relativePath: relativePath, under: shaderRoot, createParentDirectories: false),
+                  !((try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false),
+                  fileManager.fileExists(atPath: url.path),
+                  (try? sha256(of: url)) == expectedHash else {
+                continue
+            }
+            // Delete only individual files that still match the exact bytes added
+            // by this installer. Modified or newly added user files remain intact.
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    private static func shaderFileURL(
+        relativePath: String,
+        under root: URL,
+        createParentDirectories: Bool
+    ) throws -> URL? {
+        guard isSafeShaderRelativePath(relativePath) else { return nil }
+        let fileManager = FileManager.default
+        let rootURL = root.standardizedFileURL
+        var rootIsDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: rootURL.path, isDirectory: &rootIsDirectory) {
+            let values = try rootURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard rootIsDirectory.boolValue, values.isDirectory == true, values.isSymbolicLink != true else { return nil }
+        } else {
+            guard createParentDirectories else { return nil }
+            try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: false)
+        }
+
+        let components = relativePath.split(separator: "/").map(String.init)
+        var parentURL = rootURL
+        for component in components.dropLast() {
+            parentURL.appendPathComponent(component, isDirectory: true)
+            if itemExistsIncludingSymlink(at: parentURL) {
+                guard let values = try? parentURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      values.isDirectory == true, values.isSymbolicLink != true else { return nil }
+            } else if createParentDirectories {
+                try fileManager.createDirectory(at: parentURL, withIntermediateDirectories: false)
+            } else {
+                return nil
+            }
+        }
+        let result = parentURL.appendingPathComponent(components[components.count - 1]).standardizedFileURL
+        guard result.path.hasPrefix(rootURL.path + "/") else { return nil }
+        return result
+    }
+
+    private static func itemExistsIncludingSymlink(at url: URL) -> Bool {
+        if FileManager.default.fileExists(atPath: url.path) { return true }
+        return (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+    }
+
+    private static func isSafeShaderRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.contains("\\"), !path.contains("\0") else { return false }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.isEmpty && components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
 
     private static func allowedManagedName(_ name: String) -> Bool {
@@ -974,12 +1183,12 @@ enum InstallerService {
             throw InstallerError.patchMismatch("The ReShade PE alignment values are invalid.")
         }
 
-        var sections: [(name: String, virtualSize: Int, virtualAddress: Int, rawSize: Int, rawPointer: Int, characteristics: UInt32)] = []
+        var sections: [PESection] = []
         for index in 0..<sectionCount {
             let headerOffset = sectionTableOffset + index * 40
             let rawName = Array(source[headerOffset..<(headerOffset + 8)].prefix { $0 != 0 })
             let name = String(bytes: rawName, encoding: .ascii) ?? ""
-            sections.append((
+            sections.append(PESection(
                 name: name,
                 virtualSize: Int(readUInt32(source, at: headerOffset + 8)),
                 virtualAddress: Int(readUInt32(source, at: headerOffset + 12)),
@@ -994,22 +1203,41 @@ enum InstallerService {
             throw InstallerError.patchMismatch("The ReShade runtime already contains the guard section or has no compatible code section.")
         }
 
-        // The font workaround is discovered semantically from the IID bytes, not
-        // from a ReShade-version-specific file offset. Only patch copies stored in
-        // non-executable PE sections; old builds without this IID need no change.
+        // Discover the internal Device1 IID from executable references, rather than
+        // changing every copy of the GUID or relying on a ReShade-version offset.
         let device1IID = data(hex: "29fb4ba0ef08d643a49ca9bdbdcbe686")
         let device1IIDMatches = occurrences(of: device1IID, in: source)
-        let device1QueryOffsets = device1IIDMatches.filter { offset in
-            sections.contains { section in
+        let queryInterfaceReferences = queryInterfaceIIDReferences(in: source, sections: sections)
+        let simdLoadReferences = simdIIDReferences(in: source, sections: sections)
+        var device1QueryOffsets: [Int] = []
+        var iidRVAsByOffset: [Int: Int] = [:]
+        for offset in device1IIDMatches {
+            let owners = sections.filter { section in
                 let sectionEnd = section.rawPointer + section.rawSize
                 return section.rawSize > 0 && section.rawPointer >= 0 &&
                     sectionEnd >= section.rawPointer && sectionEnd <= source.count &&
-                    offset >= section.rawPointer && offset <= sectionEnd - device1IID.count &&
-                    section.name != ".text" && (section.characteristics & 0x20000000) == 0
+                    offset >= section.rawPointer && offset <= sectionEnd - device1IID.count
+            }
+            guard owners.count == 1, let owner = owners.first, !owner.isExecutable else {
+                throw InstallerError.patchMismatch("The Device1 IID was found outside a unique non-executable PE data section. Nothing was patched.")
+            }
+            let iidRVA = owner.virtualAddress + offset - owner.rawPointer
+            iidRVAsByOffset[offset] = iidRVA
+            if !(queryInterfaceReferences[iidRVA] ?? []).isEmpty {
+                device1QueryOffsets.append(offset)
             }
         }
-        guard device1IIDMatches.count == device1QueryOffsets.count else {
-            throw InstallerError.patchMismatch("The Device1 IID was found outside a safe non-executable PE data section. Nothing was patched.")
+        guard device1QueryOffsets.count <= 1 else {
+            throw InstallerError.patchMismatch("The Device1 IID is used by multiple internal QueryInterface paths. The font workaround is ambiguous, so nothing was patched.")
+        }
+        // ReShade 4.3–4.9 copy a static GUID table with RIP-relative MOVUPS loads;
+        // the GUID reference is not adjacent to QueryInterface in those builds.
+        // Use that fallback only when the DLL has exactly one copy of this IID.
+        if device1QueryOffsets.isEmpty, device1IIDMatches.count == 1,
+           let offset = device1IIDMatches.first,
+           let iidRVA = iidRVAsByOffset[offset],
+           !(simdLoadReferences[iidRVA] ?? []).isEmpty {
+            device1QueryOffsets.append(offset)
         }
         let siteOffsetInText = build.resizeSite - textSection.rawPointer
         guard siteOffsetInText >= 0,
@@ -1073,9 +1301,8 @@ enum InstallerService {
         writeUInt32(UInt32(align(guardRVA + insertedGuard.count, to: sectionAlignment)), into: &bytes, at: optionalHeaderOffset + 56)
         writeUInt32(0, into: &bytes, at: optionalHeaderOffset + 64) // PE checksum is stale after patching.
 
-        // Hash the standard patch before applying the optional IID adjustment.
-        // Older profiles' known output hashes describe that baseline, while the
-        // two already-verified 6.x outputs include the IID adjustment themselves.
+        // Profiles may hash either the base compatibility patch or the same patch
+        // with its single, reference-verified Device1 IID adjustment.
         let baselinePatchedHash = digest(bytes)
         for offset in device1QueryOffsets {
             bytes[offset] ^= 1
@@ -1091,7 +1318,7 @@ enum InstallerService {
 
     private static func patchWineFastoptEmission(
         in bytes: inout Data,
-        sections: [(name: String, virtualSize: Int, virtualAddress: Int, rawSize: Int, rawPointer: Int, characteristics: UInt32)]
+        sections: [PESection]
     ) throws {
         let fastoptTemplate = Data("[fastopt] ".utf8)
         let loopTemplate = Data("[loop]    ".utf8)
@@ -1286,6 +1513,131 @@ enum InstallerService {
             searchStart = range.lowerBound + needle.count
         }
         return result
+    }
+
+    private static func queryInterfaceIIDReferences(in source: Data, sections: [PESection]) -> [Int: [Int]] {
+        var references: [Int: [Int]] = [:]
+        for section in sections where section.isExecutable && section.rawSize > 0 {
+            guard section.rawPointer >= 0, section.rawPointer <= source.count,
+                  section.rawSize <= source.count - section.rawPointer else { continue }
+            let sectionEnd = section.rawPointer + section.rawSize
+            var cursor = section.rawPointer
+            while cursor + 7 <= sectionEnd {
+                let rex = source[cursor]
+                if (0x40...0x4F).contains(rex), (rex & 0x0C) == 0x08,
+                   source[cursor + 1] == 0x8D {
+                    let modRM = source[cursor + 2]
+                    // LEA RDX, [RIP + disp32]: RDX carries QueryInterface's IID argument.
+                    if (modRM & 0xC7) == 0x05, ((modRM >> 3) & 0x07) == 0x02 {
+                        let displacement = Int(Int32(bitPattern: readUInt32(source, at: cursor + 3)))
+                        let instructionRVA = section.virtualAddress + cursor - section.rawPointer
+                        let targetRVA = instructionRVA + 7 + displacement
+                        if hasQueryInterfaceCall(after: cursor + 7, in: source, sectionEnd: sectionEnd) {
+                            references[targetRVA, default: []].append(cursor)
+                        }
+                    }
+                }
+                cursor += 1
+            }
+        }
+        return references
+    }
+
+    private static func simdIIDReferences(in source: Data, sections: [PESection]) -> [Int: [Int]] {
+        var references: [Int: [Int]] = [:]
+        for section in sections where section.isExecutable && section.rawSize > 0 {
+            guard section.rawPointer >= 0, section.rawPointer <= source.count,
+                  section.rawSize <= source.count - section.rawPointer else { continue }
+            let sectionEnd = section.rawPointer + section.rawSize
+            var cursor = section.rawPointer
+            while cursor + 7 <= sectionEnd {
+                var opcodeOffset = cursor
+                var hasScalarPrefix = false
+                while opcodeOffset < min(cursor + 4, sectionEnd) {
+                    let prefix = source[opcodeOffset]
+                    if prefix == 0xF2 || prefix == 0xF3 {
+                        hasScalarPrefix = true
+                        opcodeOffset += 1
+                    } else if prefix == 0x66 || (0x40...0x4F).contains(prefix) {
+                        opcodeOffset += 1
+                    } else {
+                        break
+                    }
+                }
+                // Also avoid rediscovering the opcode byte after a scalar F2/F3 prefix.
+                if opcodeOffset == cursor, cursor > section.rawPointer,
+                   source[cursor - 1] == 0xF2 || source[cursor - 1] == 0xF3 {
+                    cursor += 1
+                    continue
+                }
+                guard opcodeOffset + 7 <= sectionEnd,
+                      !hasScalarPrefix,
+                      source[opcodeOffset] == 0x0F, source[opcodeOffset + 1] == 0x10 else {
+                    cursor += 1
+                    continue
+                }
+                let modRM = source[opcodeOffset + 2]
+                // MOVUPS/MOVUPD (full 128-bit vector loads) from RIP-relative data.
+                guard (modRM & 0xC7) == 0x05 else {
+                    cursor += 1
+                    continue
+                }
+                let displacement = Int(Int32(bitPattern: readUInt32(source, at: opcodeOffset + 3)))
+                let instructionLength = opcodeOffset - cursor + 7
+                let instructionRVA = section.virtualAddress + cursor - section.rawPointer
+                let targetRVA = instructionRVA + instructionLength + displacement
+                references[targetRVA, default: []].append(cursor)
+                cursor += 1
+            }
+        }
+        return references
+    }
+
+    private static func hasQueryInterfaceCall(after offset: Int, in source: Data, sectionEnd: Int) -> Bool {
+        // The IID load is sometimes followed by stack setup before the virtual call.
+        let searchEnd = min(offset + 32, sectionEnd)
+        guard offset < searchEnd else { return false }
+        for candidate in offset..<searchEnd where isQueryInterfaceCall(at: candidate, in: source, sectionEnd: sectionEnd) {
+            return true
+        }
+        return false
+    }
+
+    private static func isQueryInterfaceCall(at offset: Int, in source: Data, sectionEnd: Int) -> Bool {
+        if isIndirectVTableSlotZeroCall(at: offset, in: source, sectionEnd: sectionEnd) {
+            return true
+        }
+        // Some compiler builds load the object's vtable immediately before calling
+        // slot zero (IUnknown::QueryInterface) through RAX.
+        guard offset + 3 <= sectionEnd,
+              source[offset] == 0x48, source[offset + 1] == 0x8B, source[offset + 2] == 0x01 else {
+            return false
+        }
+        return isIndirectVTableSlotZeroCall(at: offset + 3, in: source, sectionEnd: sectionEnd)
+    }
+
+    private static func isIndirectVTableSlotZeroCall(at offset: Int, in source: Data, sectionEnd: Int) -> Bool {
+        guard offset < sectionEnd else { return false }
+        var opcodeOffset = offset
+        if (0x40...0x4F).contains(source[opcodeOffset]) {
+            opcodeOffset += 1
+        }
+        guard opcodeOffset + 2 <= sectionEnd, source[opcodeOffset] == 0xFF else { return false }
+        let modRM = source[opcodeOffset + 1]
+        guard ((modRM >> 3) & 0x07) == 0x02 else { return false } // CALL r/m64
+        let mode = (modRM >> 6) & 0x03
+        let baseRegister = modRM & 0x07
+        guard baseRegister != 0x04, baseRegister != 0x05 else { return false }
+        switch mode {
+        case 0:
+            return true
+        case 1:
+            return opcodeOffset + 3 <= sectionEnd && source[opcodeOffset + 2] == 0
+        case 2:
+            return opcodeOffset + 6 <= sectionEnd && readUInt32(source, at: opcodeOffset + 2) == 0
+        default:
+            return false
+        }
     }
 
     private static func littleEndian(_ value: Int32) -> Data {

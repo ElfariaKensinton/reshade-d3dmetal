@@ -687,11 +687,11 @@ private struct ContentView: View {
             .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.accentColor.opacity(0.25), lineWidth: 1))
 
-            sectionHeader(number: "03", title: "Effects and install", subtitle: "Existing files are preserved in a backup folder before anything is replaced.")
+            sectionHeader(number: "03", title: "Effects and install", subtitle: "Runtime and configuration files are backed up. Existing shaders and textures are preserved; only missing official effects are added.")
             Toggle(isOn: $model.installShaders) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Install the official shader effects").font(.system(size: 13, weight: .semibold))
-                    Text("Downloads the ReShade shader repository into reshade-shaders/ beside the game.")
+                    Text("Adds missing official effects and textures without overwriting existing shaders, custom files, or edits.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
@@ -774,7 +774,7 @@ private struct ContentView: View {
                 guideDivider
                 guideStep(number: "5", title: "Launch and open ReShade", body: "Start the game through the same wrapper. On first launch the effects compile; give it a moment. Press Home to open the ReShade overlay, then select or create a preset.")
                 guideDivider
-                guideStep(number: "6", title: "Restore or uninstall", body: "Return to this app, select the same game .exe, and choose Restore backup. The app removes its installed files and restores the files saved before installation. The backup folder is retained for recovery.")
+                guideStep(number: "6", title: "Restore or uninstall", body: "Return to this app, select the same game .exe, and choose Restore backup. The app restores the original runtime and configuration, removes only unchanged shader files it added, and preserves custom shaders, textures, and edits. The backup folder is retained for recovery.")
             }
             .padding(.horizontal, 18)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
