@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the verified ReShade 6.8.0 D3DMetal compatibility runtime.
+"""Reproduce the ReShade 6.8.0 D3DMetal/Wine compatibility runtime.
 Usage: python3 patch.py ORIGINAL_DLL OUTPUT_DLL
 """
 import hashlib
@@ -52,5 +52,12 @@ put32(opt + 56, align(rva + len(guard), u32(opt + 32)))
 put32(opt + 64, 0)
 actual = hashlib.sha256(b).hexdigest()
 assert actual == '8452bd0220d36b175babfce52d2395ef21dc47d59f116d718c287292ace2fc2a', actual
+# ReShade emits this HLSL template for loop attributes. Wine's shader compiler
+# rejects [fastopt], so use the equivalent explicit [loop] control attribute.
+fastopt_template = b'[fastopt] '
+loop_template = b'[loop]    '
+assert len(fastopt_template) == len(loop_template)
+assert b.count(fastopt_template) == 1, 'Expected one ReShade HLSL fastopt template.'
+b = b.replace(fastopt_template, loop_template, 1)
 dst.write_bytes(b)
-print('Patched:', dst, 'SHA256:', actual)
+print('Patched:', dst, 'SHA256:', hashlib.sha256(b).hexdigest())

@@ -38,6 +38,7 @@ Open **Shaders** and use **Add game** to register each game's 64-bit `.exe`. The
 - The patch accepts only the 22 x64 builds listed above. Each version has its own checked setup/runtime hashes, patch locations, byte signatures, and expected patched output hash; unsupported versions are rejected. The installer validates the PE headers and writes its hook into a dedicated executable `.rguard` section, checking that the hook site falls inside the declared `.text` section.
 - ReShade 4.0.2 is excluded because its archived setup did not provide an x64 runtime. ReShade 5.1.1 is excluded because the required archived artifacts were unavailable. Versions 6.0.0 through 6.7.1 are not enabled because the compatibility hook layout has not been verified for those builds.
 - The supported injection path is 64-bit DXGI. Other graphics APIs and 32-bit games are not supported by this build.
+- During runtime patching, the installer changes ReShade's generated HLSL loop-control template from `[fastopt]` to `[loop]` when that template is present. This is part of the ReShade runtime patch, so it applies to shader files ReShade loads from any configured effect path, including files users copy into place themselves. The explicit loop hint avoids Wine's unsupported `fastopt` attribute; shader source files are left untouched. Shader compilation may take longer because `fastopt` is a compile-time speed hint.
 - The shader archive is downloaded from the ReShade shader repository's `slim` branch. Shader downloads are optional.
 - This is an experimental community compatibility patch, not an official ReShade release. Injection may break a game or conflict with anti-cheat. Use with games and prefixes you control, and keep the automatic backup until the result is confirmed.
 
@@ -53,8 +54,12 @@ Open **Shaders** and use **Add game** to register each game's 64-bit `.exe`. The
 
 - ReShade setup SHA-256: `92ad42fb05187fc03e40c4b86eb87410b0068f1ee6bef19d2db52294b529cde0`
 - Official `ReShade64.dll` SHA-256: `789a47742f9a9bdf14202a1d00ac98d2fef8f1240adb5e1f9ffa651b0df728a7`
-- Patched `dxgi.dll` SHA-256: `1cffb3fc0b89338176b4c5c55eb20fd66ce612808d7d6c7ac30ad090c395c2b6`
+- Patched `dxgi.dll` SHA-256: `2278882e3acef4a0718bc97ce318c3b639b6f1c7ce3e4e01c2c02f5226f8b920`
+
+## ReShade HUD text on D3DMetal
+
+The 6.7.2 and 6.8.0 profiles force ReShade’s internal Device1 queries to use legacy blend-state creation, addressing garbled overlay text caused by D3DMetal’s `CreateBlendState1` path losing alpha blending. Each profile uses its version-specific signature and offset. The 6.7.2 patched hash is reproducible, but its in-game font fix still needs runtime confirmation.
 
 ## Subnautica 6.8.0 compatibility
 
-The 6.8.0 profile also forces ReShade’s internal Device1 queries to use legacy blend-state creation, restoring overlay text on D3DMetal. New installations disable Generic Depth and Effect Runtime Sync; with these add-ons enabled Subnautica stalls during startup. Depth-dependent effects are unavailable while Generic Depth is disabled. Verified at the main menu with a readable, interactive ReShade overlay.
+New installations disable Generic Depth and Effect Runtime Sync; with these add-ons enabled Subnautica stalls during startup. Depth-dependent effects are unavailable while Generic Depth is disabled. The 6.8.0 profile was verified at the main menu with a readable, interactive ReShade overlay.

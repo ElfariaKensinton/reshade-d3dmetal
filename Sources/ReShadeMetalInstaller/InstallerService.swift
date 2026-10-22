@@ -63,7 +63,7 @@ enum InstallerService {
             setupURL: URL(string: "https://reshade.me/downloads/ReShade_Setup_6.7.2.exe")!,
             setupSHA256: "92ad42fb05187fc03e40c4b86eb87410b0068f1ee6bef19d2db52294b529cde0",
             runtimeSHA256: "789a47742f9a9bdf14202a1d00ac98d2fef8f1240adb5e1f9ffa651b0df728a7",
-            patchedSHA256: "1cffb3fc0b89338176b4c5c55eb20fd66ce612808d7d6c7ac30ad090c395c2b6",
+            patchedSHA256: "2278882e3acef4a0718bc97ce318c3b639b6f1c7ce3e4e01c2c02f5226f8b920",
             iidOffset: 0x3D2058,
             resizeSite: 0x14BAB0
         ),
@@ -250,6 +250,10 @@ enum InstallerService {
     ]
     static let shaderArchiveURL = URL(string: "https://github.com/crosire/reshade-shaders/archive/refs/heads/slim.zip")!
     static let manifestName = ".reshade-metal-install.json"
+
+    private static var guardCodeTemplate: Data {
+        data(hex: "443b81200100007539443b8924010000753085d274083b91480100007524448b5424284585d27409443b91300100007511448b542430443b9160010000750331c0c34889e044894018e9000000009090")
+    }
 
     private struct InstallManifest: Codable {
         var formatVersion: Int
@@ -671,7 +675,7 @@ enum InstallerService {
             throw InstallerError.invalidDownload("The extracted ReShade64.dll did not match the verified ReShade \(build.version) x64 runtime.")
         }
 
-        progress("Applying the checked D3DMetal compatibility patch…")
+        progress("Applying checked D3DMetal and Wine shader-compiler compatibility patches…")
         let patchedDLL = try patchRuntime(at: extractedRuntime, output: workingDirectory.appendingPathComponent("dxgi.dll"), build: build)
 
         var stagedShaders: URL?
@@ -929,7 +933,7 @@ enum InstallerService {
 
         let expectedIID = data(hex: "378c5ca0c6d23247b3a09ce0b0dc9ae6")
         let expectedInstructions = data(hex: "488bc444894018")
-        let guardCode = data(hex: "443b81200100007539443b8924010000753085d274083b91480100007524448b5424284585d27409443b91300100007511448b542430443b9160010000750331c0c34889e044894018e9000000009090")
+        let guardCode = guardCodeTemplate
         guard source.count >= 0x40,
               source[0] == 0x4D, source[1] == 0x5A,
               build.iidOffset >= 0, build.iidOffset <= source.count - expectedIID.count,
@@ -970,7 +974,7 @@ enum InstallerService {
             throw InstallerError.patchMismatch("The ReShade PE alignment values are invalid.")
         }
 
-        var sections: [(name: String, virtualSize: Int, virtualAddress: Int, rawSize: Int, rawPointer: Int)] = []
+        var sections: [(name: String, virtualSize: Int, virtualAddress: Int, rawSize: Int, rawPointer: Int, characteristics: UInt32)] = []
         for index in 0..<sectionCount {
             let headerOffset = sectionTableOffset + index * 40
             let rawName = Array(source[headerOffset..<(headerOffset + 8)].prefix { $0 != 0 })
@@ -980,13 +984,32 @@ enum InstallerService {
                 virtualSize: Int(readUInt32(source, at: headerOffset + 8)),
                 virtualAddress: Int(readUInt32(source, at: headerOffset + 12)),
                 rawSize: Int(readUInt32(source, at: headerOffset + 16)),
-                rawPointer: Int(readUInt32(source, at: headerOffset + 20))
+                rawPointer: Int(readUInt32(source, at: headerOffset + 20)),
+                characteristics: readUInt32(source, at: headerOffset + 36)
             ))
         }
         guard !sections.contains(where: { $0.name == ".rguard" }),
               let textSection = sections.first(where: { $0.name == ".text" }),
               build.resizeSite >= textSection.rawPointer else {
             throw InstallerError.patchMismatch("The ReShade runtime already contains the guard section or has no compatible code section.")
+        }
+
+        // The font workaround is discovered semantically from the IID bytes, not
+        // from a ReShade-version-specific file offset. Only patch copies stored in
+        // non-executable PE sections; old builds without this IID need no change.
+        let device1IID = data(hex: "29fb4ba0ef08d643a49ca9bdbdcbe686")
+        let device1IIDMatches = occurrences(of: device1IID, in: source)
+        let device1QueryOffsets = device1IIDMatches.filter { offset in
+            sections.contains { section in
+                let sectionEnd = section.rawPointer + section.rawSize
+                return section.rawSize > 0 && section.rawPointer >= 0 &&
+                    sectionEnd >= section.rawPointer && sectionEnd <= source.count &&
+                    offset >= section.rawPointer && offset <= sectionEnd - device1IID.count &&
+                    section.name != ".text" && (section.characteristics & 0x20000000) == 0
+            }
+        }
+        guard device1IIDMatches.count == device1QueryOffsets.count else {
+            throw InstallerError.patchMismatch("The Device1 IID was found outside a safe non-executable PE data section. Nothing was patched.")
         }
         let siteOffsetInText = build.resizeSite - textSection.rawPointer
         guard siteOffsetInText >= 0,
@@ -1027,17 +1050,6 @@ enum InstallerService {
 
         var bytes = source
         bytes[build.iidOffset] ^= 1
-        if build.version == "6.8.0" {
-            // D3DMetal advertises Device1, but its CreateBlendState1 path loses
-            // alpha blending. Keep the public wrapper IID unchanged and force
-            // only ReShade's internal queries onto CreateBlendState instead.
-            let device1Offset = 0x3E81A8
-            let device1IID = data(hex: "29fb4ba0ef08d643a49ca9bdbdcbe686")
-            guard source.subdata(in: device1Offset..<(device1Offset + device1IID.count)) == device1IID else {
-                throw InstallerError.patchMismatch("The internal D3D11 Device1 query signature did not match.")
-            }
-            bytes[device1Offset] ^= 1
-        }
         var branch = Data([0xE9])
         branch.append(contentsOf: littleEndian(hookDisplacement))
         branch.append(contentsOf: [0x90, 0x90])
@@ -1061,12 +1073,51 @@ enum InstallerService {
         writeUInt32(UInt32(align(guardRVA + insertedGuard.count, to: sectionAlignment)), into: &bytes, at: optionalHeaderOffset + 56)
         writeUInt32(0, into: &bytes, at: optionalHeaderOffset + 64) // PE checksum is stale after patching.
 
-        let actualPatchedHash = digest(bytes)
-        guard actualPatchedHash == build.patchedSHA256 else {
-            throw InstallerError.patchMismatch("ReShade \(build.version) patched hash mismatch: expected \(build.patchedSHA256), got \(actualPatchedHash). The file was discarded.")
+        // Hash the standard patch before applying the optional IID adjustment.
+        // Older profiles' known output hashes describe that baseline, while the
+        // two already-verified 6.x outputs include the IID adjustment themselves.
+        let baselinePatchedHash = digest(bytes)
+        for offset in device1QueryOffsets {
+            bytes[offset] ^= 1
         }
+        let actualPatchedHash = digest(bytes)
+        guard actualPatchedHash == build.patchedSHA256 || baselinePatchedHash == build.patchedSHA256 else {
+            throw InstallerError.patchMismatch("ReShade \(build.version) patched output did not match its verified baseline. Expected \(build.patchedSHA256), got \(actualPatchedHash). The file was discarded.")
+        }
+        try patchWineFastoptEmission(in: &bytes, sections: sections)
         try bytes.write(to: outputURL, options: .atomic)
         return outputURL
+    }
+
+    private static func patchWineFastoptEmission(
+        in bytes: inout Data,
+        sections: [(name: String, virtualSize: Int, virtualAddress: Int, rawSize: Int, rawPointer: Int, characteristics: UInt32)]
+    ) throws {
+        let fastoptTemplate = Data("[fastopt] ".utf8)
+        let loopTemplate = Data("[loop]    ".utf8)
+        guard fastoptTemplate.count == loopTemplate.count else {
+            throw InstallerError.patchMismatch("The Wine shader-compiler compatibility template has an invalid size.")
+        }
+
+        let matches = occurrences(of: fastoptTemplate, in: bytes)
+        let safeMatches = matches.filter { offset in
+            sections.contains { section in
+                let sectionEnd = section.rawPointer + section.rawSize
+                let isReadOnlyData = (section.characteristics & 0x40000000) != 0 &&
+                    (section.characteristics & (0x80000000 | 0x20000000)) == 0
+                return isReadOnlyData && section.rawSize > 0 && section.rawPointer >= 0 &&
+                    sectionEnd >= section.rawPointer && sectionEnd <= bytes.count &&
+                    offset >= section.rawPointer && offset <= sectionEnd - fastoptTemplate.count
+            }
+        }
+        guard matches.count == safeMatches.count else {
+            throw InstallerError.patchMismatch("The ReShade shader-compiler template was found outside a read-only data section. Nothing was written.")
+        }
+        // Some older supported ReShade builds do not contain this HLSL template.
+        // In those builds there is no Wine fastopt emission to rewrite.
+        for offset in safeMatches {
+            bytes.replaceSubrange(offset..<(offset + fastoptTemplate.count), with: loopTemplate)
+        }
     }
 
     private static func readUInt16(_ data: Data, at offset: Int) -> UInt16 {
@@ -1094,10 +1145,59 @@ enum InstallerService {
     }
 
     private static func isReShadeRuntime(at url: URL) throws -> Bool {
-        let fileHash = try sha256(of: url)
+        let bytes = try Data(contentsOf: url, options: .mappedIfSafe)
+        let fileHash = digest(bytes)
         // Only recognize builds whose identity is known. A broad string scan could
         // mistake an unrelated DXGI proxy for ReShade and silently skip chaining it.
-        return supportedBuilds.contains { fileHash == $0.patchedSHA256 || fileHash == $0.runtimeSHA256 }
+        // A runtime patched by this installer may have a different hash when the
+        // discovered Device1 IID was adjusted, so also validate its guard section.
+        return supportedBuilds.contains { fileHash == $0.patchedSHA256 || fileHash == $0.runtimeSHA256 } ||
+            hasInstallerGuardSection(in: bytes)
+    }
+
+    private static func hasInstallerGuardSection(in bytes: Data) -> Bool {
+        guard bytes.count >= 0x40, bytes[0] == 0x4D, bytes[1] == 0x5A else { return false }
+        let peOffset = Int(readUInt32(bytes, at: 0x3C))
+        guard peOffset >= 0x40, peOffset <= bytes.count - 24,
+              bytes[peOffset] == 0x50, bytes[peOffset + 1] == 0x45,
+              bytes[peOffset + 2] == 0, bytes[peOffset + 3] == 0 else { return false }
+
+        let sectionCount = Int(readUInt16(bytes, at: peOffset + 6))
+        let optionalHeaderOffset = peOffset + 24
+        let optionalHeaderSize = Int(readUInt16(bytes, at: peOffset + 20))
+        guard optionalHeaderSize >= 112,
+              optionalHeaderOffset <= bytes.count - optionalHeaderSize,
+              readUInt16(bytes, at: optionalHeaderOffset) == 0x20B,
+              sectionCount > 0 else { return false }
+
+        let sectionTableOffset = optionalHeaderOffset + optionalHeaderSize
+        guard sectionCount <= (bytes.count - sectionTableOffset) / 40 else { return false }
+        let template = guardCodeTemplate
+        let jumpTemplate = data(hex: "e900000000")
+        guard let jumpRange = template.range(of: jumpTemplate, options: .backwards) else { return false }
+
+        for sectionIndex in 0..<sectionCount {
+            let headerOffset = sectionTableOffset + sectionIndex * 40
+            let rawName = Array(bytes[headerOffset..<(headerOffset + 8)].prefix { $0 != 0 })
+            guard String(bytes: rawName, encoding: .ascii) == ".rguard" else { continue }
+
+            let virtualSize = Int(readUInt32(bytes, at: headerOffset + 8))
+            let rawSize = Int(readUInt32(bytes, at: headerOffset + 16))
+            let rawPointer = Int(readUInt32(bytes, at: headerOffset + 20))
+            let characteristics = readUInt32(bytes, at: headerOffset + 36)
+            guard virtualSize == template.count,
+                  rawSize >= template.count,
+                  rawPointer >= 0, rawPointer <= bytes.count - template.count,
+                  characteristics == 0x60000020 else { return false }
+
+            for index in 0..<template.count {
+                // The relative return displacement is filled for each runtime.
+                if index > jumpRange.lowerBound && index < jumpRange.lowerBound + 5 { continue }
+                if bytes[rawPointer + index] != template[index] { return false }
+            }
+            return true
+        }
+        return false
     }
 
     private static func is64BitPE(_ url: URL) throws -> Bool {
@@ -1172,6 +1272,18 @@ enum InstallerService {
             guard let byte = UInt8(hex[index..<next], radix: 16) else { return Data() }
             result.append(byte)
             index = next
+        }
+        return result
+    }
+
+    private static func occurrences(of needle: Data, in haystack: Data) -> [Int] {
+        guard !needle.isEmpty, needle.count <= haystack.count else { return [] }
+        var result: [Int] = []
+        var searchStart = haystack.startIndex
+        while searchStart <= haystack.endIndex - needle.count,
+              let range = haystack.range(of: needle, options: [], in: searchStart..<haystack.endIndex) {
+            result.append(range.lowerBound)
+            searchStart = range.lowerBound + needle.count
         }
         return result
     }
